@@ -458,17 +458,20 @@ def test_align_categories_rejects_changed_category_value_type() -> None:
 
 
 @withCUDA
+@pytest.mark.parametrize("prefix", ["", "a" * 57])
 def test_align_categories_ensemble_matches_member_fits(
     device: torch.device,
+    prefix: str,
 ) -> None:
+    categories = ((prefix + "red", prefix + "blue", prefix + "green"),)
     first_context = _table(
         [[0], [1]],
-        categories=(("red", "blue", "green"),),
+        categories=categories,
         device=device,
     )
     second_context = _table(
         [[1], [2]],
-        categories=(("red", "blue", "green"),),
+        categories=categories,
         device=device,
     )
     member_table_ids = (1, 0, 1, 0, 0, 1, 1, 0)
@@ -478,7 +481,7 @@ def test_align_categories_ensemble_matches_member_fits(
     )
     query = _table(
         [[0], [1], [2]],
-        categories=(("red", "blue", "green"),),
+        categories=categories,
         device=device,
     )
     query_ensemble = EnsembleTable.from_tables(
@@ -570,9 +573,12 @@ def test_string_category_lookups_compile(
 
 @withCUDA
 @pytest.mark.parametrize("count", [8, 300])
-def test_align_categories_utf8_views(count: int, device: torch.device) -> None:
+@pytest.mark.parametrize("prefix", ["", "a" * 57])
+def test_align_categories_utf8_views(
+    count: int, prefix: str, device: torch.device
+) -> None:
     values = [
-        f"é\x00long-prefix-{index:04}" + ("\x00" if index % 2 else "")
+        f"{prefix}é\x00long-prefix-{index:04}" + ("\x00" if index % 2 else "")
         for index in range(count)
     ] + ["a", "a\x00", ""]
     backing = StringTensor.from_list(
@@ -625,3 +631,48 @@ def test_align_categories_distinguishes_long_common_prefixes(
     )
     output = AlignCategories().fit(context).transform(query)
     assert output.categorical.code.squeeze(-1).tolist() == [1, -1, 0, -1]
+
+
+@withCUDA
+@pytest.mark.parametrize("prefix", ["", "a" * 57])
+def test_align_categories_mixed_category_types(
+    device: torch.device, prefix: str
+) -> None:
+    context = TableTensor(
+        categorical=CategoricalTensor(
+            code=torch.tensor(
+                [[0, 1], [1, 0], [0, 1]], dtype=torch.int32, device=device
+            ),
+            categories=(
+                StringTensor.from_list(
+                    [prefix + "red", prefix + "blue"], device=device
+                ),
+                torch.tensor([20, 10], device=device),
+            ),
+        ),
+    )
+    query = TableTensor(
+        categorical=CategoricalTensor(
+            code=torch.tensor(
+                [[0, 0], [1, 1], [2, 2], [-1, -1]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            categories=(
+                StringTensor.from_list(
+                    [prefix + "blue", prefix + "unknown", prefix + "red"],
+                    device=device,
+                ),
+                torch.tensor([10, 30, 20], device=device),
+            ),
+        ),
+    )
+
+    output = AlignCategories(sort_by="frequency").fit(context).transform(query)
+
+    assert output.categorical.code.tolist() == [
+        [1, 0],
+        [-1, -1],
+        [0, 1],
+        [-1, -1],
+    ]
