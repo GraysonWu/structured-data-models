@@ -6,6 +6,7 @@ from typing import Literal, cast
 
 import torch
 from torch import Tensor
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from sdm import (
     CategoricalTensor,
@@ -18,6 +19,7 @@ from sdm import (
 from sdm.nn._buffer import BufferList
 from sdm.processing import EnsembleProcessor
 from sdm.relational.join import join_index
+from sdm.tensor._string_keys import pack
 from sdm.tensor.categorical import _iter_categories
 from sdm.tensor.var_len import _cat, _contiguous
 
@@ -340,6 +342,21 @@ class AlignCategories(EnsembleProcessor):
     ) -> tuple[Tensor, ...]:
         if not input_categories:
             return ()
+        # Bound packed-key work to eight words per category.
+        if all(
+            max(left._max_length, cast(StringTensor, right)._max_length) <= 56
+            for left, right in zip(
+                input_categories, fitted_categories, strict=True
+            )
+        ):
+            return tuple(
+                _native_string_lookup(
+                    left, cast(StringTensor, right), codes.dtype
+                )
+                for left, right in zip(
+                    input_categories, fitted_categories, strict=True
+                )
+            )
         # StringTensor does not handle this custom op. Pass its underlying
         # tensors and layout without copying the string data.
         inputs, input_layout = _flatten_strings(input_categories)
@@ -499,6 +516,43 @@ class AlignCategories(EnsembleProcessor):
         return (
             f"{' ' * indent}{self.__class__.__name__}({', '.join(arguments)})"
         )
+
+
+def _native_string_lookup(
+    left: StringTensor, right: StringTensor, dtype: torch.dtype
+) -> Tensor:
+    width = max(left._max_length, right._max_length)
+    left_keys, _ = pack(left, width)
+    right_keys, _ = pack(right, width)
+    right_ids = torch.arange(right.numel(), dtype=dtype, device=right.device)
+    # Limit the pairwise temporary; larger vocabularies use sorting.
+    if statically_known_true(left_keys.numel() * right.numel() <= 65536):
+        # [L, R]: category vectors contain no nulls.
+        equal = (left_keys[:, None, :] == right_keys[None, :, :]).all(-1)
+        return torch.where(equal, right_ids, -1).amax(-1)
+
+    keys = torch.cat((left_keys, right_keys))
+    order = torch.arange(keys.size(0), device=keys.device)
+    for column in range(keys.size(1) - 1, -1, -1):
+        order = order[keys[order, column].argsort(stable=True)]
+    sorted_keys = keys[order]
+    starts = torch.cat(
+        (
+            torch.ones(1, dtype=torch.bool, device=keys.device),
+            (sorted_keys[1:] != sorted_keys[:-1]).any(-1),
+        )
+    )
+    groups = starts.long().cumsum(0) - 1
+    values = torch.cat(
+        (
+            right_ids.new_full((left.numel(),), -1),
+            right_ids,
+        )
+    )
+    matches = right_ids.new_full((keys.size(0),), -1)
+    matches.scatter_reduce_(0, groups, values[order], reduce="amax")
+    result = torch.empty_like(matches).scatter_(0, order, matches[groups])
+    return result[: left.numel()]
 
 
 def _flatten_strings(

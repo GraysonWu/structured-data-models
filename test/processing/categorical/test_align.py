@@ -506,10 +506,15 @@ def test_align_categories_ensemble_matches_member_fits(
         assert fitted_query_output[member_id].equal(expected_query)
 
 
-def test_string_category_lookups_compile(compilation: None) -> None:
+@pytest.mark.parametrize("count", [0, 300])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_string_category_lookups_compile(
+    compilation: None, count: int, dynamic: bool
+) -> None:
+    extra = [f"long-prefix-{index:04}" for index in range(count)]
     fitted = (
-        StringTensor.from_list(["a", "b"]),
-        StringTensor.from_list(["a", "x"]),
+        StringTensor.from_list(["a", "b", *extra]),
+        StringTensor.from_list(["a", "x", *extra]),
     )
     codes = torch.empty((), dtype=torch.int32)
 
@@ -520,23 +525,103 @@ def test_string_category_lookups_compile(compilation: None) -> None:
             codes=codes,
         )
 
-    compiled = torch.compile(lookups, backend="inductor", fullgraph=True)
-    first, second = compiled(StringTensor.from_list(["b", "z", "a"]))
+    graph = torch._dynamo.explain(lookups)(
+        StringTensor.from_list(["b", "z", "a", *extra[::-1]])
+    )
+    assert graph.graph_break_count == 0
+    assert all(
+        "string_category_lookup" not in str(node.target)
+        for captured in graph.graphs
+        for node in captured.graph.nodes
+    )
+    compiled = torch.compile(
+        lookups, backend="inductor", fullgraph=True, dynamic=dynamic
+    )
+    first, second = compiled(
+        StringTensor.from_list(["b", "z", "a", *extra[::-1]])
+    )
     torch.testing.assert_close(
         actual=first,
-        expected=torch.tensor([1, -1, 0], dtype=codes.dtype),
+        expected=torch.tensor(
+            [1, -1, 0, *range(count + 1, 1, -1)], dtype=codes.dtype
+        ),
     )
     torch.testing.assert_close(
         actual=second,
-        expected=torch.tensor([-1, -1, 0], dtype=codes.dtype),
+        expected=torch.tensor(
+            [-1, -1, 0, *range(count + 1, 1, -1)], dtype=codes.dtype
+        ),
     )
 
-    first, second = compiled(StringTensor.from_list(["x", "z", "q"]))
+    first, second = compiled(StringTensor.from_list(["x", "z", "q", *extra]))
     torch.testing.assert_close(
         actual=first,
-        expected=torch.tensor([-1, -1, -1], dtype=codes.dtype),
+        expected=torch.tensor(
+            [-1, -1, -1, *range(2, count + 2)], dtype=codes.dtype
+        ),
     )
     torch.testing.assert_close(
         actual=second,
-        expected=torch.tensor([1, -1, -1], dtype=codes.dtype),
+        expected=torch.tensor(
+            [1, -1, -1, *range(2, count + 2)], dtype=codes.dtype
+        ),
     )
+
+
+@withCUDA
+@pytest.mark.parametrize("count", [8, 300])
+def test_align_categories_utf8_views(count: int, device: torch.device) -> None:
+    values = [
+        f"é\x00long-prefix-{index:04}" + ("\x00" if index % 2 else "")
+        for index in range(count)
+    ] + ["a", "a\x00", ""]
+    backing = StringTensor.from_list(
+        [
+            "skip",
+            *[
+                value
+                for key in [*values, "unknown"]
+                for value in (key, "skip")
+            ],
+        ],
+        device=device,
+    )
+    context = _table(
+        [[index] for index in range(len(values))],
+        categories=(tuple(values[::-1]),),
+        device=device,
+    )
+    query = TableTensor(
+        categorical=CategoricalTensor(
+            code=torch.arange(
+                -1, len(values) + 1, dtype=torch.int32, device=device
+            )[:, None],
+            categories=(backing[1::2],),
+        ),
+    )
+    output = AlignCategories().fit(context).transform(query)
+    assert output.categorical.code.squeeze(-1).tolist() == [
+        -1,
+        *range(len(values) - 1, -1, -1),
+        -1,
+    ]
+
+
+@withCUDA
+@pytest.mark.parametrize("width", [7, 55, 56, 257])
+def test_align_categories_distinguishes_long_common_prefixes(
+    width: int, device: torch.device
+) -> None:
+    prefix = "a" * width
+    context = _table(
+        [[0], [1]],
+        categories=((prefix + "x", prefix + "y"),),
+        device=device,
+    )
+    query = _table(
+        [[0], [1], [2], [-1]],
+        categories=((prefix + "y", prefix + "z", prefix + "x"),),
+        device=device,
+    )
+    output = AlignCategories().fit(context).transform(query)
+    assert output.categorical.code.squeeze(-1).tolist() == [1, -1, 0, -1]
