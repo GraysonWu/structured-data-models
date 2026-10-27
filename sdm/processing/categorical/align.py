@@ -342,9 +342,11 @@ class AlignCategories(EnsembleProcessor):
     ) -> tuple[Tensor, ...]:
         if not input_categories:
             return ()
-        # Bound packed-key work to eight words per category.
+        # Bound packed keys to twelve words on CUDA and eight elsewhere.
+        max_width = 84 if codes.is_cuda else 56
         if all(
-            max(left._max_length, cast(StringTensor, right)._max_length) <= 56
+            max(left._max_length, cast(StringTensor, right)._max_length)
+            <= max_width
             for left, right in zip(
                 input_categories, fitted_categories, strict=True
             )

@@ -509,17 +509,35 @@ def test_align_categories_ensemble_matches_member_fits(
         assert fitted_query_output[member_id].equal(expected_query)
 
 
+@withCUDA
+@pytest.mark.parametrize("prefix", ["", "é" * 34])
 @pytest.mark.parametrize("count", [0, 300])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_string_category_lookups_compile(
-    compilation: None, count: int, dynamic: bool
+    compilation: None,
+    count: int,
+    dynamic: bool,
+    prefix: str,
+    device: torch.device,
 ) -> None:
-    extra = [f"long-prefix-{index:04}" for index in range(count)]
+    if prefix and device.type != "cuda":
+        pytest.skip("Wide native string lookup is CUDA-only")
+    extra = [f"{prefix}long-prefix-{index:04}" for index in range(count)]
     fitted = (
-        StringTensor.from_list(["a", "b", *extra]),
-        StringTensor.from_list(["a", "x", *extra]),
+        StringTensor.from_list(
+            [prefix + "a", prefix + "b", *extra], device=device
+        ),
+        StringTensor.from_list(
+            [prefix + "a", prefix + "x", *extra], device=device
+        ),
     )
-    codes = torch.empty((), dtype=torch.int32)
+    codes = torch.empty((), dtype=torch.int32, device=device)
+
+    def categories(values: list[str]) -> StringTensor:
+        return StringTensor.from_list(
+            [prefix + value for value in values] + extra[::-1],
+            device=device,
+        )
 
     def lookups(categories: StringTensor) -> tuple[torch.Tensor, ...]:
         return AlignCategories._string_category_lookups(
@@ -528,9 +546,7 @@ def test_string_category_lookups_compile(
             codes=codes,
         )
 
-    graph = torch._dynamo.explain(lookups)(
-        StringTensor.from_list(["b", "z", "a", *extra[::-1]])
-    )
+    graph = torch._dynamo.explain(lookups)(categories(["b", "z", "a"]))
     assert graph.graph_break_count == 0
     assert all(
         "string_category_lookup" not in str(node.target)
@@ -540,33 +556,39 @@ def test_string_category_lookups_compile(
     compiled = torch.compile(
         lookups, backend="inductor", fullgraph=True, dynamic=dynamic
     )
-    first, second = compiled(
-        StringTensor.from_list(["b", "z", "a", *extra[::-1]])
-    )
+    first, second = compiled(categories(["b", "z", "a"]))
     torch.testing.assert_close(
         actual=first,
         expected=torch.tensor(
-            [1, -1, 0, *range(count + 1, 1, -1)], dtype=codes.dtype
+            [1, -1, 0, *range(count + 1, 1, -1)],
+            dtype=codes.dtype,
+            device=device,
         ),
     )
     torch.testing.assert_close(
         actual=second,
         expected=torch.tensor(
-            [-1, -1, 0, *range(count + 1, 1, -1)], dtype=codes.dtype
+            [-1, -1, 0, *range(count + 1, 1, -1)],
+            dtype=codes.dtype,
+            device=device,
         ),
     )
 
-    first, second = compiled(StringTensor.from_list(["x", "z", "q", *extra]))
+    first, second = compiled(categories(["x", "z", "q"]))
     torch.testing.assert_close(
         actual=first,
         expected=torch.tensor(
-            [-1, -1, -1, *range(2, count + 2)], dtype=codes.dtype
+            [-1, -1, -1, *range(count + 1, 1, -1)],
+            dtype=codes.dtype,
+            device=device,
         ),
     )
     torch.testing.assert_close(
         actual=second,
         expected=torch.tensor(
-            [1, -1, -1, *range(2, count + 2)], dtype=codes.dtype
+            [1, -1, -1, *range(count + 1, 1, -1)],
+            dtype=codes.dtype,
+            device=device,
         ),
     )
 
@@ -614,7 +636,7 @@ def test_align_categories_utf8_views(
 
 
 @withCUDA
-@pytest.mark.parametrize("width", [7, 55, 56, 257])
+@pytest.mark.parametrize("width", [7, 55, 56, 74, 83, 84, 257])
 def test_align_categories_distinguishes_long_common_prefixes(
     width: int, device: torch.device
 ) -> None:
