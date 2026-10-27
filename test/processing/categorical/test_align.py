@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
 from typing import Literal
 
 import pandas as pd
@@ -540,7 +541,7 @@ def test_string_category_lookups_compile(
     dynamic: bool,
 ) -> None:
     device = torch.device("cuda")
-    prefix = "é" * 34
+    prefix = "é" * 56
     extra = [f"{prefix}long-prefix-{index:04}" for index in range(count)]
     fitted = (
         StringTensor.from_list(
@@ -550,6 +551,7 @@ def test_string_category_lookups_compile(
             [prefix + "a", prefix + "x", *extra], device=device
         ),
     )
+    fitted = pickle.loads(pickle.dumps(fitted))
     codes = torch.empty((), dtype=torch.int32, device=device)
 
     def categories(values: list[str]) -> StringTensor:
@@ -625,7 +627,7 @@ def test_align_categories_utf8_views(count: int, device: torch.device) -> None:
 
 
 @withCUDA
-@pytest.mark.parametrize("width", [83, 84])
+@pytest.mark.parametrize("width", [84, 127, 255, 1023])
 def test_align_categories_distinguishes_long_common_prefixes(
     width: int, device: torch.device
 ) -> None:
@@ -667,9 +669,15 @@ def test_align_categories_mixed_category_types(
                 device=device,
             ),
             categories=(
-                StringTensor.from_list(
-                    ["blue", "unknown", "red"],
-                    device=device,
+                StringTensor(
+                    data=torch.tensor(
+                        list(b"blueunknownred"),
+                        dtype=torch.uint8,
+                        device=device,
+                    ),
+                    offset=torch.tensor([0, 4, 11, 14], device=device),
+                    valid=None,
+                    size=(3,),
                 ),
                 torch.tensor([10, 30, 20], device=device),
             ),

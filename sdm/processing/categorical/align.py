@@ -342,9 +342,9 @@ class AlignCategories(EnsembleProcessor):
     ) -> tuple[Tensor, ...]:
         if not input_categories:
             return ()
-        # Bound packed-key work to twelve words per category.
         if codes.is_cuda and all(
-            max(left._max_length, cast(StringTensor, right)._max_length) <= 84
+            left._max_length is not None
+            and cast(StringTensor, right)._max_length is not None
             for left, right in zip(
                 input_categories, fitted_categories, strict=True
             )
@@ -517,11 +517,11 @@ class AlignCategories(EnsembleProcessor):
 def _native_string_lookup(
     left: StringTensor, right: StringTensor, dtype: torch.dtype
 ) -> Tensor:
-    width = max(left._max_length, right._max_length)
+    width = max(cast(int, left._max_length), cast(int, right._max_length))
     left_keys, _ = pack(left, width)
     right_keys, _ = pack(right, width)
     right_ids = torch.arange(right.numel(), dtype=dtype, device=right.device)
-    # Limit the pairwise temporary; larger vocabularies use sorting.
+    # Bound the pairwise boolean temporary to 64 KiB; otherwise sort keys.
     if statically_known_true(left_keys.numel() * right.numel() <= 65536):
         # [L, R]: category vectors contain no nulls.
         equal = (left_keys[:, None, :] == right_keys[None, :, :]).all(-1)
