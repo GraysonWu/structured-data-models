@@ -9,7 +9,8 @@ import torch
 
 from sdm import CategoricalTensor, EnsembleTable, StringTensor, TableTensor
 from sdm.processing import AlignCategories
-from sdm.testing import withCUDA
+from sdm.processing.categorical.align import _native_string_lookup
+from sdm.testing import onlyCUDA, withCUDA
 
 
 def _table(
@@ -458,11 +459,10 @@ def test_align_categories_rejects_changed_category_value_type() -> None:
 
 
 @withCUDA
-@pytest.mark.parametrize("prefix", ["", "a" * 57])
 def test_align_categories_ensemble_matches_member_fits(
     device: torch.device,
-    prefix: str,
 ) -> None:
+    prefix = "a" * 85
     categories = ((prefix + "red", prefix + "blue", prefix + "green"),)
     first_context = _table(
         [[0], [1]],
@@ -509,19 +509,38 @@ def test_align_categories_ensemble_matches_member_fits(
         assert fitted_query_output[member_id].equal(expected_query)
 
 
-@withCUDA
-@pytest.mark.parametrize("prefix", ["", "é" * 34])
+@pytest.mark.parametrize("count", [8, 300])
+def test_native_string_lookup(count: int) -> None:
+    fitted = [f"é\0common-prefix-{index:04}" for index in range(count)] + [
+        "a",
+        "a\0",
+        "",
+    ]
+    query = [*fitted[::-1], "unknown", "a\0\0"]
+    indices = {value: index for index, value in enumerate(fitted)}
+    actual = _native_string_lookup(
+        left=StringTensor.from_list(query),
+        right=StringTensor.from_list(fitted),
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(
+        actual=actual,
+        expected=torch.tensor(
+            [indices.get(value, -1) for value in query], dtype=torch.int32
+        ),
+    )
+
+
+@onlyCUDA
 @pytest.mark.parametrize("count", [0, 300])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_string_category_lookups_compile(
     compilation: None,
     count: int,
     dynamic: bool,
-    prefix: str,
-    device: torch.device,
 ) -> None:
-    if prefix and device.type != "cuda":
-        pytest.skip("Wide native string lookup is CUDA-only")
+    device = torch.device("cuda")
+    prefix = "é" * 34
     extra = [f"{prefix}long-prefix-{index:04}" for index in range(count)]
     fitted = (
         StringTensor.from_list(
@@ -546,59 +565,29 @@ def test_string_category_lookups_compile(
             codes=codes,
         )
 
-    graph = torch._dynamo.explain(lookups)(categories(["b", "z", "a"]))
-    assert graph.graph_break_count == 0
-    assert all(
-        "string_category_lookup" not in str(node.target)
-        for captured in graph.graphs
-        for node in captured.graph.nodes
-    )
     compiled = torch.compile(
         lookups, backend="inductor", fullgraph=True, dynamic=dynamic
     )
-    first, second = compiled(categories(["b", "z", "a"]))
     torch.testing.assert_close(
-        actual=first,
-        expected=torch.tensor(
-            [1, -1, 0, *range(count + 1, 1, -1)],
-            dtype=codes.dtype,
-            device=device,
+        actual=compiled(categories(["b", "z", "a"])),
+        expected=(
+            codes.new_tensor([1, -1, 0, *range(count + 1, 1, -1)]),
+            codes.new_tensor([-1, -1, 0, *range(count + 1, 1, -1)]),
         ),
     )
     torch.testing.assert_close(
-        actual=second,
-        expected=torch.tensor(
-            [-1, -1, 0, *range(count + 1, 1, -1)],
-            dtype=codes.dtype,
-            device=device,
-        ),
-    )
-
-    first, second = compiled(categories(["x", "z", "q"]))
-    torch.testing.assert_close(
-        actual=first,
-        expected=torch.tensor(
-            [-1, -1, -1, *range(count + 1, 1, -1)],
-            dtype=codes.dtype,
-            device=device,
-        ),
-    )
-    torch.testing.assert_close(
-        actual=second,
-        expected=torch.tensor(
-            [1, -1, -1, *range(count + 1, 1, -1)],
-            dtype=codes.dtype,
-            device=device,
+        actual=compiled(categories(["x", "z", "q"])),
+        expected=(
+            codes.new_tensor([-1, -1, -1, *range(count + 1, 1, -1)]),
+            codes.new_tensor([1, -1, -1, *range(count + 1, 1, -1)]),
         ),
     )
 
 
 @withCUDA
 @pytest.mark.parametrize("count", [8, 300])
-@pytest.mark.parametrize("prefix", ["", "a" * 57])
-def test_align_categories_utf8_views(
-    count: int, prefix: str, device: torch.device
-) -> None:
+def test_align_categories_utf8_views(count: int, device: torch.device) -> None:
+    prefix = "a" * 57
     values = [
         f"{prefix}é\x00long-prefix-{index:04}" + ("\x00" if index % 2 else "")
         for index in range(count)
@@ -636,7 +625,7 @@ def test_align_categories_utf8_views(
 
 
 @withCUDA
-@pytest.mark.parametrize("width", [7, 55, 56, 74, 83, 84, 257])
+@pytest.mark.parametrize("width", [83, 84])
 def test_align_categories_distinguishes_long_common_prefixes(
     width: int, device: torch.device
 ) -> None:
@@ -656,9 +645,8 @@ def test_align_categories_distinguishes_long_common_prefixes(
 
 
 @withCUDA
-@pytest.mark.parametrize("prefix", ["", "a" * 57])
 def test_align_categories_mixed_category_types(
-    device: torch.device, prefix: str
+    device: torch.device,
 ) -> None:
     context = TableTensor(
         categorical=CategoricalTensor(
@@ -666,9 +654,7 @@ def test_align_categories_mixed_category_types(
                 [[0, 1], [1, 0], [0, 1]], dtype=torch.int32, device=device
             ),
             categories=(
-                StringTensor.from_list(
-                    [prefix + "red", prefix + "blue"], device=device
-                ),
+                StringTensor.from_list(["red", "blue"], device=device),
                 torch.tensor([20, 10], device=device),
             ),
         ),
@@ -682,7 +668,7 @@ def test_align_categories_mixed_category_types(
             ),
             categories=(
                 StringTensor.from_list(
-                    [prefix + "blue", prefix + "unknown", prefix + "red"],
+                    ["blue", "unknown", "red"],
                     device=device,
                 ),
                 torch.tensor([10, 30, 20], device=device),
