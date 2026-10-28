@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import io
+import subprocess
+import sys
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sdm.processing as sp
 from sdm import CategoricalTensor, TableTensor
@@ -61,6 +65,25 @@ def test_cpu_and_state_dict() -> None:
     torch.testing.assert_close(
         model.predict(query).numerical, expected.numerical
     )
+
+
+def test_loading_model_saved_before_cuda_graphs() -> None:
+    model = build()
+    query = fit(model, "cpu")
+    expected = model.predict(query).numerical
+    # Whole-model files from before replay support lack this field.
+    for network in model.models.values():
+        del network._cuda_graphs
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    restored = torch.load(buffer, weights_only=False)
+    restored.eval().cpu()
+    torch.testing.assert_close(restored.predict(query).numerical, expected)
+    restored.clear()
+    query = fit(restored, "cpu")
+    restored.enable_cuda_graphs()
+    restored.predict(query)
 
 
 @pytest.mark.cuda
@@ -231,3 +254,53 @@ def test_capture_exceeding_memory_budget() -> None:
         torch.testing.assert_close(actual, expected)
     # Discarding the rejected graph must also release its captured tensors.
     assert torch.cuda.memory_allocated() - before < 1024**2
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("priority_only", [False, True])
+def test_attention_backend_change(priority_only: bool) -> None:
+    model = build("cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        query = fit(model, "cuda")
+        model.enable_cuda_graphs(max_graphs=1)
+        initial = [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+        changed = [SDPBackend.MATH, SDPBackend.FLASH_ATTENTION]
+        if not priority_only:
+            initial = [SDPBackend.FLASH_ATTENTION]
+            changed = [SDPBackend.MATH]
+        with sdpa_kernel(initial, set_priority=True):
+            model.predict(query)
+        # With the graph limit reached, a different backend must run normally.
+        with sdpa_kernel(changed, set_priority=True):
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as p:
+                actual = model.predict(query).numerical
+                torch.cuda.synchronize()
+            assert any(
+                "_scaled_dot_product_attention_math" in e.key
+                for e in p.key_averages()
+            )
+            model.disable_cuda_graphs()
+            torch.testing.assert_close(actual, model.predict(query).numerical)
+
+
+def test_new_precision_api() -> None:
+    if not hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+        pytest.skip("Requires the PyTorch 2.9 precision API")
+    # A subprocess isolates the mutually exclusive old/new global APIs.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import torch
+from sdm.models.kumo.tabular.graph import _matmul_precision
+for precision in ["tf32", "ieee"]:
+    torch.backends.fp32_precision = precision
+    assert _matmul_precision() == precision
+""",
+        ],
+        check=True,
+    )

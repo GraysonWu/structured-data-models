@@ -23,6 +23,13 @@ def _layout(tensor: Tensor) -> tuple[object, ...]:
     return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
 
 
+def _matmul_precision() -> str:
+    precision = getattr(torch.backends.cuda.matmul, "fp32_precision", None)
+    if precision is not None:
+        return precision
+    return torch.get_float32_matmul_precision()
+
+
 class _CudaGraphs:
     """Bounded replay storage for the tabular network, owned by one model."""
 
@@ -70,8 +77,20 @@ class _CudaGraphs:
             stream.cuda_stream,
             torch.is_autocast_enabled("cuda"),
             torch.get_autocast_dtype("cuda"),
-            torch.get_float32_matmul_precision(),
+            _matmul_precision(),
             torch.is_inference_mode_enabled(),
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+            # sdpa_kernel(set_priority=True) has no public priority getter.
+            tuple(torch._C._get_sdp_priority_order()),
+            torch.backends.cuda.fp16_bf16_reduction_math_sdp_allowed(),
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_fp16_accumulation,
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
         )
         if key not in self.states:
             if len(self.states) >= self.max_graphs:

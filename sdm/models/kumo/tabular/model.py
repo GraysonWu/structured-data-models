@@ -360,6 +360,10 @@ class _KumoTabular(torch.nn.Module):
         x = self.row_project(x)
         return self.icl_block(x=x, y=y, cache=cache)
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self.__dict__.setdefault("_cuda_graphs", None)
+
     def _clear_graphs(self) -> None:
         if self._cuda_graphs is not None:
             self._cuda_graphs.clear()
