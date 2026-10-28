@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sdm import StringTensor
+from sdm.tensor.string import _sort_native
 from sdm.testing import onlyCUDA, withCUDA
 
 
@@ -410,3 +411,128 @@ def test_registers_as_a_pytorch_buffer() -> None:
     module.register_buffer("value", tensor)
 
     assert tuple(module.buffers()) == (tensor,)
+
+
+SHARED = "b" * 300
+SORT_VALUES = [
+    [],
+    [None, None],
+    ["", "", None, "\0", "\0a", "a", "a", None],
+    ["é", "e", "中", "😀", "é", "\x7f", "\x80"],
+    ["a" * 7 + "b", "a" * 8, "a" * 7, "a" * 14, None],
+    ["ba", None, "", "a\0", "é", "a", "ba", "b" * 20, None, "a" * 9],
+    # Strings that tie on their prefix are ordered by their remaining bytes.
+    ["é" * 511 + "a\0", "é" * 511 + "a", "é" * 511 + "b", "é" * 511 + "a\0"],
+    [
+        SHARED + "a",
+        SHARED,
+        "z" * 600,
+        SHARED + "a",
+        None,
+        "z" * 400,
+        "",
+        "é" * 200,
+        "a",
+        "z" * 400,
+        "é" * 200,
+        SHARED + "\0",
+    ],
+]
+
+
+def strided(values: list[str | None], device: torch.device) -> StringTensor:
+    # Interleaved padding gives the view a storage offset and a stride.
+    storage: list[str | None] = ["unused"]
+    for value in values:
+        storage.extend([value, "unused"])
+    tensor = StringTensor.from_list(storage, device=device)[1::2]
+    return cast(StringTensor, tensor)
+
+
+def sorted_indices(values: list[str | None], descending: bool) -> list[int]:
+    # UTF-8 byte order, stable, with nulls last in both directions.
+    indices = sorted(
+        (i for i, value in enumerate(values) if value is not None),
+        key=lambda i: cast(str, values[i]).encode("utf-8"),
+        reverse=descending,
+    )
+    indices.extend(i for i, value in enumerate(values) if value is None)
+    return indices
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("values", SORT_VALUES)
+@withCUDA
+def test_sort_stable(
+    values: list[str | None],
+    descending: bool,
+    native: bool,
+    device: torch.device,
+) -> None:
+    tensor = strided(values, device)
+    indices = sorted_indices(values, descending)
+
+    if native:
+        out, perm = _sort_native(tensor, descending=descending)
+    else:
+        out, perm = torch.sort(tensor, descending=descending, stable=True)
+    assert out.tolist() == [values[i] for i in indices]
+    assert perm.tolist() == indices
+    assert out.device == device
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("values", SORT_VALUES[-3:])
+@onlyCUDA
+def test_sort_native_fullgraph(
+    compilation: None,
+    values: list[str | None],
+    descending: bool,
+) -> None:
+    tensor = strided(values, torch.device("cuda"))
+
+    def sort(inp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.sort(inp, descending=descending, stable=True)
+
+    out, perm = torch.compile(sort, fullgraph=True)(tensor)
+    indices = sorted_indices(values, descending)
+    assert perm.tolist() == indices
+    assert out.tolist() == [values[i] for i in indices]
+
+
+@withCUDA
+def test_sort_null_payload(device: torch.device) -> None:
+    # Null slots may contain arbitrary bytes and must retain their input order.
+    array = pa.Array.from_buffers(
+        pa.string(),
+        4,
+        [
+            pa.py_buffer(bytes([0b00000101])),
+            pa.py_buffer(
+                torch.tensor([0, 1, 4, 5, 8], dtype=torch.int32).numpy()
+            ),
+            pa.py_buffer(bytearray(b"bzzzazzz")),
+        ],
+    )
+    tensor = StringTensor.from_arrow(array, device=device)
+    out, perm = _sort_native(tensor, descending=False)
+    assert out.tolist() == ["a", "b", None, None]
+    assert perm.tolist() == [2, 0, 1, 3]
+
+
+@withCUDA
+def test_sort_repeated_view(device: torch.device) -> None:
+    tensor = StringTensor.from_list(["abc"], device=device).expand(5)
+    out, perm = _sort_native(cast(StringTensor, tensor), descending=False)
+    assert out.tolist() == ["abc"] * 5
+    assert perm.tolist() == list(range(5))
+
+
+@withCUDA
+def test_sort_empty_payload(device: torch.device) -> None:
+    values = ["", ""]
+    tensor = StringTensor.from_list(values, device=device)
+    out, perm = _sort_native(tensor, descending=False)
+    assert out.tolist() == values
+    assert perm.tolist() == list(range(len(values)))
