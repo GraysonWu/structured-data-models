@@ -8,13 +8,13 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from sdm.cache import Cache
+from sdm.cache import Cache, KVCacheEntry
 
 
 @dataclass
 class _Graph:
     inputs: tuple[Tensor, ...]
-    cache: Cache
+    cache_tensors: list[Tensor]
     graph: torch.cuda.CUDAGraph
     output: Tensor
 
@@ -70,6 +70,16 @@ class _CudaGraphs:
             or torch.cuda.get_allocator_backend() != "native"
         ):
             return forward(*inputs, cache=cache)
+        with torch.cuda.device(x.device):
+            if torch.cuda.is_current_stream_capturing():
+                return forward(*inputs, cache=cache)
+        # The network consumes K/V entries and cell imputation means, not
+        # class vocabularies or other preprocessing/postprocessing metadata.
+        cache = Cache(
+            (key, value)
+            for key, value in cache.items()
+            if isinstance(value, KVCacheEntry) or key == "cell_impute_mean"
+        ).freeze()
         tensors = tuple(cache._tensors())
         stream = torch.cuda.current_stream(x.device)
         key = (
@@ -115,7 +125,7 @@ class _CudaGraphs:
                     t.numel() * t.element_size()
                     for s in self.states.values()
                     if s is not None
-                    for t in (*s.inputs, *s.cache._tensors())
+                    for t in (*s.inputs, *s.cache_tensors)
                 )
                 if size + buffers <= self.max_memory_bytes:
                     self.states[key] = state
@@ -127,7 +137,7 @@ class _CudaGraphs:
             dst.copy_(src)
         # Prefetch can replace cache storage for every estimator. Captured
         # kernels always read these stable buffers, refreshed before replay.
-        torch._foreach_copy_(list(state.cache._tensors()), list(tensors))
+        torch._foreach_copy_(state.cache_tensors, list(tensors))
         state.graph.replay()
         return state.output.clone()
 
@@ -145,7 +155,7 @@ class _CudaGraphs:
             stream.wait_stream(current)
             # Do not capture temporary autocast weight-cache pointers.
             with torch.autocast(
-                "cuda",
+                device_type="cuda",
                 enabled=torch.is_autocast_enabled("cuda"),
                 dtype=torch.get_autocast_dtype("cuda"),
                 cache_enabled=False,
@@ -158,4 +168,9 @@ class _CudaGraphs:
                 with torch.cuda.graph(graph, stream=stream):
                     output = forward(*static, cache=cache)
                 current.wait_stream(stream)
-            return _Graph(static, cache, graph, output)
+            return _Graph(
+                inputs=static,
+                cache_tensors=list(cache._tensors()),
+                graph=graph,
+                output=output,
+            )

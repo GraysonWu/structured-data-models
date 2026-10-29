@@ -5,14 +5,18 @@ import copy
 import io
 import subprocess
 import sys
+from typing import cast
 
 import pytest
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sdm.processing as sp
-from sdm import CategoricalTensor, TableTensor
+from sdm import CategoricalTensor, StringTensor, TableTensor
+from sdm.cache import Cache, KVCacheEntry
 from sdm.models import KumoTabular
+from sdm.models.kumo.tabular.graph import _CudaGraphs
+from sdm.testing import onlyCUDA
 
 
 def build(device: str = "cpu", task: str = "regression") -> KumoTabular:
@@ -30,7 +34,9 @@ def build(device: str = "cpu", task: str = "regression") -> KumoTabular:
 def fit(
     model: KumoTabular, device: str, estimators: int = 1, classes: int = 0
 ) -> TableTensor:
-    x = TableTensor.from_tensor(torch.randn(24, 3, device=device))
+    values = torch.randn(24, 3, device=device)
+    values[0, 0] = torch.nan
+    x = TableTensor.from_tensor(values)
     if classes:
         y = TableTensor(
             columns={"categorical": ("target",)},
@@ -41,8 +47,8 @@ def fit(
     else:
         y = TableTensor.from_tensor(torch.randn(24, 1, device=device))
     model.fit(
-        x,
-        y,
+        x=x,
+        y=y,
         num_estimators=estimators,
         recipe=sp.Recipe(
             features=[], target=sp.Identity(), output=[sp.AverageEstimators()]
@@ -58,12 +64,12 @@ def test_cpu_and_state_dict() -> None:
     keys = tuple(model.state_dict())
     model.enable_cuda_graphs()
     torch.testing.assert_close(
-        model.predict(query).numerical, expected.numerical
+        actual=model.predict(query).numerical, expected=expected.numerical
     )
     assert tuple(model.state_dict()) == keys
     model.disable_cuda_graphs()
     torch.testing.assert_close(
-        model.predict(query).numerical, expected.numerical
+        actual=model.predict(query).numerical, expected=expected.numerical
     )
 
 
@@ -86,8 +92,7 @@ def test_loading_model_saved_before_cuda_graphs() -> None:
     restored.predict(query)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 @pytest.mark.parametrize("classes", [0, 2, 12])
 @pytest.mark.parametrize("estimators", [1, 4])
 def test_replay_values_refit_and_disable(
@@ -104,7 +109,7 @@ def test_replay_values_refit_and_disable(
     torch.testing.assert_close(first, expected[0])
     torch.testing.assert_close(actual, expected[1])
     torch.testing.assert_close(
-        first, saved
+        actual=first, expected=saved
     )  # Replay must not overwrite callers.
     assert not torch.allclose(expected[0], expected[1])
     query = fit(model, "cuda", estimators, classes)
@@ -113,8 +118,7 @@ def test_replay_values_refit_and_disable(
     torch.testing.assert_close(model.predict(query).numerical, actual)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 @pytest.mark.parametrize("budget", [0, 2 * 1024**3])
 def test_shapes_precision_and_serialization(budget: int) -> None:
     model = build("cuda")
@@ -140,8 +144,7 @@ def test_shapes_precision_and_serialization(budget: int) -> None:
         torch.testing.assert_close(model.predict(query).numerical, actual)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 def test_graph_launch_and_shape_limit() -> None:
     model = build("cuda")
     query = fit(model, "cuda")
@@ -170,9 +173,8 @@ def test_graph_launch_and_shape_limit() -> None:
     torch.testing.assert_close(model.predict(query[:1]).numerical, actual)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_precision_stream_and_device_changes() -> None:
+@onlyCUDA
+def test_precision_and_stream_changes() -> None:
     model = build("cuda")
     query = fit(model, "cuda")
     expected = model.predict(query).numerical.clone()
@@ -197,15 +199,9 @@ def test_precision_stream_and_device_changes() -> None:
         actual = model.predict(query).numerical
     torch.cuda.current_stream().wait_stream(stream)
     torch.testing.assert_close(actual, expected)
-    model.cpu()
-    query = fit(model, "cpu")
-    actual = model.predict(query).numerical
-    model.disable_cuda_graphs()
-    torch.testing.assert_close(actual, model.predict(query).numerical)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 def test_float32_matmul_precision() -> None:
     precision = torch.get_float32_matmul_precision()
     try:
@@ -223,8 +219,7 @@ def test_float32_matmul_precision() -> None:
         torch.set_float32_matmul_precision(precision)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 def test_capture_exceeding_memory_budget() -> None:
     model = build("cuda")
     query = fit(model, "cuda")
@@ -256,8 +251,7 @@ def test_capture_exceeding_memory_budget() -> None:
     assert torch.cuda.memory_allocated() - before < 1024**2
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@onlyCUDA
 @pytest.mark.parametrize("priority_only", [False, True])
 def test_attention_backend_change(priority_only: bool) -> None:
     model = build("cuda")
@@ -291,7 +285,7 @@ def test_new_precision_api() -> None:
         pytest.skip("Requires the PyTorch 2.9 precision API")
     # A subprocess isolates the mutually exclusive old/new global APIs.
     subprocess.run(
-        [
+        args=[
             sys.executable,
             "-c",
             """
@@ -304,3 +298,95 @@ for precision in ["tf32", "ieee"]:
         ],
         check=True,
     )
+
+
+@onlyCUDA
+@pytest.mark.parametrize("classes", [2, 12])
+@pytest.mark.parametrize("estimators", [1, 4])
+def test_string_class_labels(classes: int, estimators: int) -> None:
+    model = build(device="cuda", task="classification")
+    x = TableTensor.from_tensor(torch.randn(24, 3, device="cuda"))
+    y = TableTensor(
+        columns={"categorical": ("target",)},
+        categorical=CategoricalTensor(
+            code=torch.arange(24, device="cuda").remainder(classes)[:, None],
+            categories=(
+                StringTensor.from_list(
+                    values=[f"class{i}" for i in range(classes)], device="cuda"
+                ),
+            ),
+        ),
+    )
+    model.fit(x=x, y=y, num_estimators=estimators)
+    queries = [x[:3], TableTensor.from_tensor(x[:3].numerical * 2 + 1)]
+    expected = [model.predict(query) for query in queries]
+    model.enable_cuda_graphs()
+    for query, reference in zip(queries, expected):
+        actual = model.predict(query)
+        assert actual.columns == reference.columns
+        torch.testing.assert_close(actual.numerical, reference.numerical)
+
+
+@onlyCUDA
+@pytest.mark.parametrize("change", ["eval", "train", "device"])
+def test_graph_invalidation(change: str) -> None:
+    model = build("cuda")
+    query = fit(model, "cuda")
+    model.enable_cuda_graphs()
+    expected = model.predict(query).numerical.clone()
+    if change == "eval":
+        model.eval()
+    elif change == "train":
+        model.train().eval()
+    else:
+        # Do not refit: fit() would independently clear the captured graph.
+        model.cpu().cuda()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        actual = model.predict(query).numerical
+        torch.cuda.synchronize()
+    events = [event.key for event in profile.key_averages()]
+    assert any("cudaGraphLaunch" in event for event in events)
+    assert any("cudaStreamBeginCapture" in event for event in events) == (
+        change != "eval"
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@onlyCUDA
+@pytest.mark.parametrize("warm", [False, True])
+def test_outer_capture(warm: bool) -> None:
+    x = torch.ones(4, device="cuda")
+    y = torch.ones_like(x)
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    cache = Cache({"kv": KVCacheEntry(x.clone(), x.clone())}).freeze()
+
+    def forward(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        categorical_mask: torch.Tensor,
+        *,
+        cache: Cache,
+    ) -> torch.Tensor:
+        return x + y + cast(KVCacheEntry, cache["kv"]).value
+
+    helper = _CudaGraphs(max_graphs=4, max_memory_bytes=2 * 1024**3)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.no_grad(), torch.cuda.stream(stream):
+        if warm:
+            helper(
+                forward=forward, x=x, y=y, categorical_mask=mask, cache=cache
+            )
+        else:
+            forward(x=x, y=y, categorical_mask=mask, cache=cache)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph, stream=stream):
+        actual = helper(
+            forward=forward, x=x, y=y, categorical_mask=mask, cache=cache
+        )
+    x.fill_(2)
+    graph.replay()
+    torch.testing.assert_close(actual, torch.full_like(x, 4))

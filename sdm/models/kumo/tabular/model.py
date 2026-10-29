@@ -155,7 +155,7 @@ class KumoTabular(ICLModel):
         """
         for model in self.models.values():
             cast(_KumoTabular, model)._cuda_graphs = _CudaGraphs(
-                max_graphs, max_memory_bytes
+                max_graphs=max_graphs, max_memory_bytes=max_memory_bytes
             )
 
     def disable_cuda_graphs(self) -> None:
@@ -344,7 +344,11 @@ class _KumoTabular(torch.nn.Module):
             and cache.is_replaying
         ):
             return self._cuda_graphs(
-                self._forward, x, y, categorical_mask, cache
+                forward=self._forward,
+                x=x,
+                y=y,
+                categorical_mask=categorical_mask,
+                cache=cache,
             )
         return self._forward(x, y, categorical_mask, cache=cache)
 
@@ -369,7 +373,8 @@ class _KumoTabular(torch.nn.Module):
             self._cuda_graphs.clear()
 
     def train(self, mode: bool = True) -> Self:
-        self._clear_graphs()
+        if self.training != mode:
+            self._clear_graphs()
         return super().train(mode)
 
     def _apply(

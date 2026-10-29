@@ -92,7 +92,7 @@ Replay is opt-in and affects cached prediction only. It preserves preprocessing,
 - `max_memory_bytes` limits retained graph pools and static buffers per task network, excluding existing model weights and fitted context. Capture can temporarily exceed this budget, and allocation or capture errors propagate. A successfully captured graph that exceeds the budget is discarded and that signature runs normally.
 - The first prediction for each captured signature includes warmup and capture. Exclude it when measuring warm latency, and synchronize the GPU before and after timing.
 - `fit()` and `clear()` discard graphs while preserving replay settings. Training mode, device/dtype changes, and loading model weights also discard graphs. Refit after changing weights or moving a fitted model. Serialized models do not include captured graphs.
-- CPU execution, gradient-enabled calls, compilation and non-native CUDA allocators run normally. Use PyTorch's native allocator for replay.
+- CPU execution, gradient-enabled calls, compilation, an active outer CUDA capture and non-native CUDA allocators bypass this replay helper. Use PyTorch's native allocator for replay. Bypassing the helper does not make preprocessing or postprocessing capture-compatible.
 - Serialize calls to the model, including fit, prediction and configuration. During capture, avoid other threads submitting CUDA work. Concurrent serving and automatic latency-based selection are outside this API's scope.
 
 ## Model Concepts
